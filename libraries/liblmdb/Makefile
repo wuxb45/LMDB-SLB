@@ -24,7 +24,7 @@ W	= -W -Wall -Wno-unused-parameter -Wbad-function-cast -Wuninitialized
 THREADS = -pthread
 OPT = -O2 -g
 CFLAGS	= $(THREADS) $(OPT) $(W) $(XCFLAGS)
-LDLIBS	=
+LDLIBS	= -lm
 SOLIBS	=
 SOEXT	= .so
 prefix	= /usr/local
@@ -41,7 +41,7 @@ IHDRS	= lmdb.h
 ILIBS	= liblmdb.a liblmdb$(SOEXT)
 IPROGS	= mdb_stat mdb_copy mdb_dump mdb_load
 IDOCS	= mdb_stat.1 mdb_copy.1 mdb_dump.1 mdb_load.1
-PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5
+PROGS	= $(IPROGS) mtest mtest2 mtest3 mtest4 mtest5 map_test
 all:	$(ILIBS) $(PROGS)
 
 install: $(ILIBS) $(IPROGS) $(IHDRS)
@@ -61,12 +61,12 @@ test:	all
 	rm -rf testdb && mkdir testdb
 	./mtest && ./mdb_stat testdb
 
-liblmdb.a:	mdb.o midl.o
-	$(AR) rs $@ mdb.o midl.o
+liblmdb.a:	mdb.o midl.o lib1.o
+	$(AR) rs $@ mdb.o midl.o lib1.o
 
-liblmdb$(SOEXT):	mdb.lo midl.lo
+liblmdb$(SOEXT):	mdb.lo midl.lo lib1.lo
 #	$(CC) $(LDFLAGS) -pthread -shared -Wl,-Bsymbolic -o $@ mdb.o midl.o $(SOLIBS)
-	$(CC) $(LDFLAGS) -pthread -shared -o $@ mdb.lo midl.lo $(SOLIBS)
+	$(CC) $(LDFLAGS) -pthread -shared -o $@ mdb.lo midl.lo lib1.lo $(SOLIBS)
 
 mdb_stat: mdb_stat.o liblmdb.a
 mdb_copy: mdb_copy.o liblmdb.a
@@ -78,6 +78,7 @@ mtest3:	mtest3.o liblmdb.a
 mtest4:	mtest4.o liblmdb.a
 mtest5:	mtest5.o liblmdb.a
 mtest6:	mtest6.o liblmdb.a
+map_test: map_test.o liblmdb.a
 
 mdb.o: mdb.c lmdb.h midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c mdb.c
@@ -85,11 +86,17 @@ mdb.o: mdb.c lmdb.h midl.h
 midl.o: midl.c midl.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c midl.c
 
+lib1.o: lib1.c lib1.h xxhash.c xxhash.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c lib1.c
+
 mdb.lo: mdb.c lmdb.h midl.h
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -c mdb.c -o $@
 
 midl.lo: midl.c midl.h
 	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -c midl.c -o $@
+
+lib1.lo: lib1.c lib1.h xxhash.c xxhash.h
+	$(CC) $(CFLAGS) -fPIC $(CPPFLAGS) -c lib1.c -o $@
 
 %:	%.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ $(LDLIBS) -o $@

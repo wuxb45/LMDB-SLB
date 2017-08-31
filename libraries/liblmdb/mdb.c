@@ -186,6 +186,7 @@ typedef SSIZE_T	ssize_t;
 
 #include "lmdb.h"
 #include "midl.h"
+#include "lib1.h"
 
 #if (BYTE_ORDER == LITTLE_ENDIAN) == (BYTE_ORDER == BIG_ENDIAN)
 # error "Unknown or unsupported endianness (BYTE_ORDER)"
@@ -1153,6 +1154,9 @@ struct MDB_txn {
 	 *	dirty_list into mt_parent after freeing hidden mt_parent pages.
 	 */
 	unsigned int	mt_dirty_room;
+  /** SLB */
+  struct rcache * rcache;
+  MDB_node * rnode;
 };
 
 /** Enough space for 2^32 nodes with minimum of 2 keys per node. I.e., plenty.
@@ -1308,6 +1312,15 @@ struct MDB_env {
 #endif
 	void		*me_userctx;	 /**< User-settable context */
 	MDB_assert_func *me_assert_func; /**< Callback for assertion failures */
+  /** SLB */
+  spinlock rcache_lock;
+  u64 rcache_size;
+  struct {
+    txnid_t txnid;
+    pgno_t root;
+    u64 refcount;
+    struct rcache * cache;
+  } rtwo[2];
 };
 
 	/** Nested transaction */
@@ -1735,6 +1748,35 @@ static void mdb_audit(MDB_txn *txn)
 	}
 }
 #endif
+
+/** SLB */
+  static bool
+mdb_match(const void * const p1, const void * const p2)
+{
+  MDB_node * n1 = (typeof(n1))p1;
+  MDB_val * n2 = (typeof(n2))p2;
+  if (n1 && n2 && (n1->mn_ksize == n2->mv_size)) {
+    return memcmp(&(n1->mn_data[0]), n2->mv_data, n1->mn_ksize) == 0 ? true : false;
+  } else {
+    return false;
+  }
+}
+
+/** SLB */
+  static u64
+mdb_hash_key(const void * const p)
+{
+  MDB_val * n = (typeof(n))p;
+  return xxhash64(n->mv_data, n->mv_size);
+}
+
+/** SLB */
+  static u64
+mdb_hash_kv(const void * const p)
+{
+  MDB_node * n = (typeof(n))p;
+  return xxhash64(&(n->mn_data[0]), n->mn_ksize);
+}
 
 int
 mdb_cmp(MDB_txn *txn, MDB_dbi dbi, const MDB_val *a, const MDB_val *b)
@@ -2911,6 +2953,33 @@ renew:
 			(void *) txn, (void *) env, txn->mt_dbs[MAIN_DBI].md_root));
 	}
 
+  /** SLB */
+  if ((flags & MDB_RDONLY) && env->rcache_size && (txn->mt_dbs[MAIN_DBI].md_flags & MDB_DUPSORT) == 0) {
+    txn->rcache = NULL;
+    spinlock_lock(&(env->rcache_lock));
+    for (u64 i = 0; i < 2; i++) {
+      if ((env->rtwo[i].txnid == txn->mt_txnid) && (env->rtwo[i].root == txn->mt_dbs[MAIN_DBI].md_root)) {
+        env->rtwo[i].refcount++;
+        txn->rcache = env->rtwo[i].cache;
+        break;
+      }
+    }
+    if (txn->rcache == NULL) { // not found
+      const u64 low = env->rtwo[0].txnid < env->rtwo[1].txnid ? 0 : 1;
+      if (env->rtwo[low].refcount == 0) {
+        env->rtwo[low].refcount++;
+        env->rtwo[low].txnid = txn->mt_txnid;
+        env->rtwo[low].root = txn->mt_dbs[MAIN_DBI].md_root;
+        rcache_clean(env->rtwo[low].cache);
+        txn->rcache = env->rtwo[low].cache;
+      }
+    }
+    spinlock_unlock(&(env->rcache_lock));
+    if (txn->rcache) {
+      txn->rnode = malloc(sizeof(MDB_node) + MDB_MAXKEYSIZE);
+    }
+  }
+
 	return rc;
 }
 
@@ -2969,6 +3038,20 @@ mdb_txn_end(MDB_txn *txn, unsigned mode)
 #if MDB_DEBUG
 	static const char *const names[] = MDB_END_NAMES;
 #endif
+
+  /** SLB */
+  if (txn->rcache) {
+    spinlock_lock(&(env->rcache_lock));
+    for (u64 i = 0; i < 2; i++) {
+      if ((env->rtwo[i].txnid == txn->mt_txnid) && (env->rtwo[i].root == txn->mt_dbs[MAIN_DBI].md_root)) {
+        env->rtwo[i].refcount--;
+      }
+    }
+    spinlock_unlock(&(env->rcache_lock));
+    if (txn->rnode) {
+      free(txn->rnode);
+    }
+  }
 
 	/* Export or close DBI handles opened in this txn */
 	mdb_dbis_update(txn, mode & MDB_END_UPDATE);
@@ -3925,6 +4008,12 @@ mdb_env_create(MDB_env **env)
 	e->me_pid = getpid();
 	GET_PAGESIZE(e->me_os_psize);
 	VGMEMP_CREATE(e,0,0);
+  /** SLB */
+  spinlock_init(&(e->rcache_lock));
+  e->rcache_size = 0;
+  e->rtwo[0].root = ~0lu;
+  e->rtwo[1].root = ~0lu;
+
 	*env = e;
 	return MDB_SUCCESS;
 }
@@ -4054,6 +4143,29 @@ mdb_env_set_maxdbs(MDB_env *env, MDB_dbi dbs)
 		return EINVAL;
 	env->me_maxdbs = dbs + CORE_DBS;
 	return MDB_SUCCESS;
+}
+
+/** SLB */
+int ESECT
+mdb_env_set_rcache(MDB_env *env, size_t size)
+{
+  if (size == env->rcache_size) {
+    return MDB_SUCCESS;
+  }
+
+  for (u64 i = 0; i < 2; i++) {
+    if (env->rcache_size) {
+      if (env->rtwo[i].cache) {
+        rcache_destroy(env->rtwo[i].cache);
+        env->rtwo[i].cache = NULL;
+      }
+    }
+    if (size) {
+      env->rtwo[i].cache = rcache_create(size, mdb_match, mdb_hash_key, mdb_hash_kv);
+    }
+  }
+  env->rcache_size = size;
+  return MDB_SUCCESS;
 }
 
 int ESECT
@@ -5125,6 +5237,13 @@ mdb_env_close(MDB_env *env)
 	}
 
 	mdb_env_close0(env, 0);
+  /** SLB */
+  for (u64 i = 0; i < 2; i++) {
+    if (env->rtwo[i].cache) {
+      rcache_destroy(env->rtwo[i].cache);
+    }
+  }
+
 	free(env);
 }
 
@@ -5752,8 +5871,27 @@ mdb_get(MDB_txn *txn, MDB_dbi dbi,
 	if (txn->mt_flags & MDB_TXN_BLOCKED)
 		return MDB_BAD_TXN;
 
+  /** SLB */
+  if (dbi == MAIN_DBI && txn->rcache) {
+    MDB_node * cnode = rcache_get(txn->rcache, key);
+    if (cnode) {
+      data->mv_size = NODEDSZ(cnode);
+      data->mv_data = NODEDATA(cnode);
+      return MDB_SUCCESS;
+    }
+  }
+
 	mdb_cursor_init(&mc, txn, dbi, &mx);
-	return mdb_cursor_set(&mc, key, data, MDB_SET, &exact);
+	const int rc = mdb_cursor_set(&mc, key, data, MDB_SET, &exact);
+  /** SLB */
+  if (dbi == MAIN_DBI && rc == MDB_SUCCESS && txn->rcache) {
+    const unsigned short top = mc.mc_top;
+    MDB_page * const p = mc.mc_pg[top];
+    const indx_t i = mc.mc_ki[top];
+    MDB_node * const node = NODEPTR(p, i);
+    rcache_hint(txn->rcache, node);
+  }
+  return rc;
 }
 
 /** Find a sibling for a page.

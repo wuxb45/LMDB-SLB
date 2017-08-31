@@ -1590,6 +1590,9 @@ int	mdb_reader_list(MDB_env *env, MDB_msg_func *func, void *ctx);
 int	mdb_reader_check(MDB_env *env, int *dead);
 /**	@} */
 
+/** SLB */
+int mdb_env_set_rcache(MDB_env *env, size_t size);
+
 #ifdef __cplusplus
 }
 #endif
